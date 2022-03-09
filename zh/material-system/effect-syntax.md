@@ -65,17 +65,16 @@ Shader 片段在语法上基于 GLSL 300 ES，在资源加载时有相应的预�
 - 编辑器内置头文件资源就在 internal DB 的 `assets/chunks` 目录下，所以可以不加目录直接引用，主要包括一些常用的工具函数和标准光照模型等。
 - 所有在同一个 effect 文件中声明的 CCProgram 代码块都可以相互引用。
 
-### 预处理宏定义
+### 宏定义判断
 
-目前 Effect 系统的设计倾向于在游戏项目运行时可以方便地利用 shader 中的各类预处理宏，进而减少 runtime branching。<br>
 编辑器会在加载资源时收集所有在 shader 中出现的 defines，然后引擎在运行时动态地将需要的声明加入 shader 内容。所以如果要使用这些预处理宏，只需要像上面的截图例子一样，在 shader 中直接进行逻辑判断即可。所有的 define 都会被序列化到 **属性检查器** 上，以便随时调整。
 
 **注意**：
 - 为尽可能多地在编译期做类型检查，目前的策略是直接将所有自定义宏设置为 true（或根据 Macro Tags 指定的默认值）再交给后端尝试检查。所以如果在设计上某些宏之间存在互斥关系（不可能同时为 true）的话，应统一使用一个通过 tag 声明的宏来处理；
-- 运行时会显式定义所有 shader 中出现的自定义宏（默认定义为 0），所以 **除了 GLSL 语言内置宏外（`GL_` 开头的 extension 等）**，请不要使用 `#ifdef` 或 `#if defined` 这样的形式做判断，否则执行结果会始终为 true；
-- 运行时会对宏定义组合计算 hash，目前的计算机制在宏定义组合数 **2^32** 以内（一个 int 的范围），相对高效，对应到 shader 中相当于 32 个 boolean 开关。所以请尽量不要超出此限制，定义过多运行时可调整的宏定义，会影响运行效率。
+- 运行时会对宏定义组合计算 hash，目前的计算机制在宏定义组合数 **2^32** 以内（一个 int 的范围），相对高效，对应到 shader 中相当于 32 个 boolean 开关。所以请尽量不要超出此限制，定义过多运行时可调整的宏定义，会影响运行效率；
+- 所有使用 `#ifdef` 或 `#if defined` 形式判断的宏定义运行时不会参与 hash 计算，也无法动态设置，仅适用于需要内嵌在 shader 文本内的分支逻辑；
 
-### Macro Tags
+### Macro Metas
 
 虽然引擎会尝试自动识别所有出现在预处理分支逻辑中 (#if) 的宏定义，但有时实际使用方式要比简单的布尔开关更复杂一些，如：
 
@@ -90,18 +89,20 @@ Shader 片段在语法上基于 GLSL 300 ES，在资源加载时有相应的预�
 float metallic = texture(pbrMap, uv).METALLIC_SOURCE;
 ```
 
-针对这类有固定取值范围或固定选项的宏定义，需要选择一个合适的 tag 显式声明：
+针对这类有固定取值范围或固定选项的宏定义需要一些额外的 meta 信息，可以选择一个合适的 tag 显式声明：
 
 | Tag     | 说明 | 默认值 | 备注 |
 | :------ | :------ | :----- | :-- |
 | range   | 一个长度为 2 的数组。首元素为最小值，末元素为最大值 | [0, 3] | 针对连续数字类型的宏定义，显式指定它的取值范围。<br>范围应当控制到最小，有利于运行时的 shader 管理 |
 | options | 一个任意长度的数组，每个元素都是一个可能的取值 | 如未显式声明则不会定义任何宏 | 针对有清晰选项的宏定义，显式指定它的可用选项 |
+| default | 一个字面值，作为默认取值 | 如未显式声明会视为普通布尔类宏定义 | 针对运行时才能确定，但能够确保始终是常量的宏定义，不参与 hash 计算 |
 
 比如下面这样的声明：
 
 ```glsl
-#pragma define LAYERS range([4, 5])
-#pragma define METALLIC_SOURCE options([r, g, b, a])
+#pragma define-meta LAYERS range([4, 5])
+#pragma define-meta METALLIC_SOURCE options([r, g, b, a])
+#pragma define-meta CC_DEVICE_SUPPORT_FLOAT_TEXTURE default(1)
 ```
 
 一个是名为 `LAYERS` 的宏定义，它在运行时可能的取值范围为 `[4, 5]`。<br>
@@ -111,28 +112,25 @@ float metallic = texture(pbrMap, uv).METALLIC_SOURCE;
 
 ### Functional Macros
 
-由于 WebGL1 不支持原生，Creator 将函数式宏定义提供为 effect 编译期的功能，输出的 shader 中就已经将此类宏定义展开。这非常适用于 inline 一些简单的工具函数，或需要大量重复定义的相似代码。事实上，内置头文件中不少工具函数都是函数式宏定义：
-
+函数式宏定义适用于 inline 一些简单的工具函数，或需要大量重复定义的相似代码。但由于 WebGL 并不原生支持这种语法，直接定义会有兼容性问题:
 ```glsl
-#define CCDecode(position) \
-  position = vec4(a_position, 1.0)
-#define CCVertInput(position) \
-  CCDecode(position);         \
-  #if CC_USE_SKINNING         \
-    CCSkin(position);         \
-  #endif                      \
-  #pragma // empty pragma trick to get rid of trailing semicolons at effect compile time
+#define SRGBToLinear(gamma) pow(gamma, vec3(2.2)) // this won't work on WebGL
 ```
 
-但与 C/C++ 的宏定义系统相同，这套机制不会对宏定义的 [卫生情况](https://en.wikipedia.org/wiki/Hygienic_macro) 做任何处理，由不卫生的宏展开而带来的问题需要开发者自行处理，因此我们推荐，并也确保所有内置头文件中，谨慎定义含有局部变量的预处理宏：
+相应地我们也提供了 Effect 编译期宏展开的机制来解决这一问题：
+```glsl
+#pragma define SRGBToLinear(gamma) pow(gamma, vec3(2.2)) // this now works since it's expanded at effect-compile time
+```
+
+事实上，普通宏定义也可以用这样的方法在 Effect 编译期就做完替换。在一些特殊地方，这也是必须的：
 
 ```glsl
-// please do be careful with unhygienic macros like this
-#define INCI(i) do { int a=0; ++i; } while(0)
-// when invoking
-int a = 4, b = 8;
-INCI(b); // correct, b would be 9 after this
-INCI(a); // wrong! a would still be 4
+// this has to be defined as effect-compile-time constant
+// or else the uniform layout information cannot be extracted correctly
+#pragma define ELEMENT_PER_BATCH 10
+uniform BatchedColor {
+  vec4 colors[ELEMENT_PER_BATCH];
+};
 ```
 
 ### Vertex Input[^1]
